@@ -1,8 +1,8 @@
 from flask import Flask, request, redirect, render_template, send_file, session, url_for
 import os
 import pandas as pd
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests
+import asyncio
+import httpx
 from bs4 import BeautifulSoup
 import logging
 
@@ -23,60 +23,56 @@ logging.basicConfig(level=logging.INFO)
 CHATBOT_KEYWORDS = {"inbox-chat", "chat-button", "chat_bubble", "chat_with_us"}
 CHATBOT_ELEMENTS = {"chat-widget", "chatbot", "messenger-chat", "chat-bubble", "livechat", "chat-window"}
 
-def has_chatbot(url):
-    """Check if a webpage contains chatbot elements or keywords."""
+async def has_chatbot(url):
+    """Asynchronously check if a webpage contains chatbot elements or keywords."""
     try:
-        response = requests.get(url, timeout=10)
-        if response.status_code != 200:
-            return False
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
-        html_content = response.text.lower()
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(url)
+            if response.status_code != 200:
+                return False
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            html_content = response.text.lower()
 
-        # Check keywords in raw HTML
-        if any(keyword in html_content for keyword in CHATBOT_KEYWORDS):
-            return True
+            # Check for chatbot keywords in raw HTML
+            if any(keyword in html_content for keyword in CHATBOT_KEYWORDS):
+                return True
 
-        # Check specific elements in parsed HTML
-        return any(soup.find_all(element) for element in CHATBOT_ELEMENTS)
-
-    except requests.RequestException as e:
+            # Check for chatbot-specific elements in parsed HTML
+            return any(soup.find_all(element) for element in CHATBOT_ELEMENTS)
+    except httpx.RequestError as e:
         logging.warning(f"Failed to check {url}: {e}")
         return False
 
 def load_urls(file_path):
-    """Load URLs from a CSV or Excel file."""
+    """Load URLs from a CSV or Excel file in chunks to handle large files efficiently."""
     try:
         if file_path.endswith('.csv'):
-            df = pd.read_csv(file_path, header=None)
+            df = pd.read_csv(file_path, header=None, chunksize=100)
         elif file_path.endswith('.xlsx'):
-            df = pd.read_excel(file_path, header=None)
+            df = pd.read_excel(file_path, header=None, chunksize=100)
         else:
             raise ValueError("Unsupported file format. Use CSV or Excel.")
         
-        return df[0].dropna().tolist()  # Remove empty values and return list
+        urls = []
+        for chunk in df:
+            urls.extend(chunk[0].dropna().tolist())  # Collect URLs from chunks
+        return urls
     except Exception as e:
         logging.error(f"Error loading file {file_path}: {e}")
         return []
 
-def process_file(file_path):
-    """Process URLs and return a list of those containing chatbots."""
+async def process_file_async(file_path):
+    """Process URLs asynchronously and return a list of those containing chatbots."""
     urls = load_urls(file_path)
     if not urls:
         return []
     
-    chatbot_urls = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_url = {executor.submit(has_chatbot, url): url for url in urls}
-
-        for future in as_completed(future_to_url):
-            url = future_to_url[future]
-            try:
-                if future.result():
-                    chatbot_urls.append(url)
-            except Exception as e:
-                logging.error(f"Error processing {url}: {e}")
-
+    # Run all URL checks asynchronously
+    results = await asyncio.gather(*(has_chatbot(url) for url in urls))
+    
+    # Filter only URLs that contain chatbots
+    chatbot_urls = [url for url, has_bot in zip(urls, results) if has_bot]
     return chatbot_urls
 
 @app.route('/')
@@ -91,7 +87,7 @@ def upload():
 
 @app.route('/process_file', methods=['POST'])
 def process_upload():
-    """Handle file upload, process it, and display results."""
+    """Handle file upload, process it asynchronously, and display results."""
     if 'file' not in request.files:
         return redirect(request.url)
 
@@ -103,15 +99,15 @@ def process_upload():
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
     file.save(file_path)
 
-    # Process URLs
-    urls_with_chatbots = process_file(file_path)
+    # Process URLs asynchronously
+    chatbot_urls = asyncio.run(process_file_async(file_path))
     
     # Store results in session for display
-    session['chatbot_urls'] = urls_with_chatbots
+    session['chatbot_urls'] = chatbot_urls
 
     # Save results to CSV
     output_file_path = os.path.join(app.config['OUTPUT_FOLDER'], 'urls_with_chatbots.csv')
-    pd.DataFrame(urls_with_chatbots, columns=['URL']).to_csv(output_file_path, index=False)
+    pd.DataFrame(chatbot_urls, columns=['URL']).to_csv(output_file_path, index=False)
 
     return redirect(url_for('show_results'))
 
